@@ -1,0 +1,65 @@
+variables:
+  AWS_REGION: "ap-southeast-1"
+  TF_ROOT: "infra/envs/dev"
+  IMAGE_NAME: "go-api"
+  TF_VAR_aws_region: $AWS_REGION
+  DOCKER_IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+stages:
+  - terraform
+  - build
+  - deploy
+
+.cache: &cache
+  paths:
+    - .terraform
+
+before_script:
+  - apk add --no-cache curl jq python3 py3-pip
+  - pip3 install yq
+
+terraform:init:
+  image: hashicorp/terraform:1.4.6
+  stage: terraform
+  script:
+    - cd $TF_ROOT
+    - terraform init -input=false
+    - terraform plan -out=tfplan -var="image_tag=${DOCKER_IMAGE_TAG}" -input=false
+  artifacts:
+    paths:
+      - $TF_ROOT/tfplan
+    expire_in: 1h
+
+build:docker:
+  image: docker:stable
+  services:
+    - docker:dind
+  stage: build
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - aws --version || (apk add --no-cache py3-pip && pip3 install awscli)
+    - aws configure set region $AWS_REGION
+    - $(aws ecr get-login --no-include-email --region $AWS_REGION)
+    - REPO_URL=$(aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region $AWS_REGION --query "repositories[0].repositoryUri" --output text || true)
+    - if [ -z "$REPO_URL" ]; then aws ecr create-repository --repository-name "$IMAGE_NAME" --region $AWS_REGION; fi
+    - REPO_URL=$(aws ecr describe-repositories --repository-names "$IMAGE_NAME" --region $AWS_REGION --query "repositories[0].repositoryUri" --output text)
+    - docker build -t ${REPO_URL}:${DOCKER_IMAGE_TAG} .
+    - docker push ${REPO_URL}:${DOCKER_IMAGE_TAG}
+  only:
+    - main
+  artifacts:
+    expire_in: 1h
+
+deploy:terraform:
+  image: hashicorp/terraform:1.4.6
+  stage: deploy
+  script:
+    - cd $TF_ROOT
+    - terraform init -input=false
+    # supply the image variable so task def uses latest image
+    - terraform apply -auto-approve -var="image=${REPO_URL}:${DOCKER_IMAGE_TAG}" -var="image_tag=${DOCKER_IMAGE_TAG}"
+  only:
+    - main
+
